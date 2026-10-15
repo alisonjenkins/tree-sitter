@@ -6763,3 +6763,636 @@ fn test_last_child_anchor_looks_past_hidden_node() {
         assert_query_matches(&language, &query, source, &[(0, vec![("last", "int y;")])]);
     });
 }
+
+/// Summarize everything that query analysis decides about a query: for every
+/// byte offset, whether the step starting there is guaranteed, then, for every
+/// pattern, whether it is rooted and non-local. A query that is rejected is
+/// summarized by its error.
+fn query_analysis_outcome(language: &Language, source: &str) -> String {
+    let query = match Query::new(language, source) {
+        Ok(query) => query,
+        Err(error) => return format!("{:?} error at {}", error.kind, error.offset),
+    };
+    let mut outcome = String::new();
+    for offset in 0..source.len() {
+        outcome.push(if query.is_pattern_guaranteed_at_step(offset) {
+            '1'
+        } else {
+            '0'
+        });
+    }
+    for pattern_index in 0..query.pattern_count() {
+        outcome.push(
+            match (
+                query.is_pattern_rooted(pattern_index),
+                query.is_pattern_non_local(pattern_index),
+            ) {
+                (true, false) => 'R',
+                (true, true) => 'N',
+                (false, false) => 'r',
+                (false, true) => 'n',
+            },
+        );
+    }
+    outcome
+}
+
+#[test]
+fn test_query_analysis_of_patterns_that_share_a_shape() {
+    struct Row {
+        description: &'static str,
+        language: Language,
+        pattern: &'static str,
+        results_by_substring: &'static [(&'static str, bool)],
+        // For each pattern, `R` if it is rooted and `r` if it is not.
+        rooted: &'static str,
+    }
+
+    // Patterns that have the same shape get the same answer wherever they are
+    // placed in a query, and patterns that differ in a single property of a
+    // single step do not.
+    let rows = [
+        Row {
+            description: "identical patterns, different captures",
+            language: get_language("javascript"),
+            pattern: r"
+                (binary_expression left: (identifier) @a1 right: (_) @b1)
+                (binary_expression left: (identifier) @a2 right: (_) @b2)
+                (binary_expression left: (identifier) @a3 right: (_) @b3)
+            ",
+            results_by_substring: &[
+                ("(binary_expression left: (identifier) @a1", false),
+                ("left: (identifier) @a1", false),
+                ("right: (_) @b1", true),
+                ("(binary_expression left: (identifier) @a2", false),
+                ("left: (identifier) @a2", false),
+                ("right: (_) @b2", true),
+                ("(binary_expression left: (identifier) @a3", false),
+                ("left: (identifier) @a3", false),
+                ("right: (_) @b3", true),
+            ],
+            rooted: "RRR",
+        },
+        Row {
+            description: "fields on different children",
+            language: get_language("javascript"),
+            pattern: r"
+                (binary_expression left: (identifier) @a1 right: (_) @b1)
+                (binary_expression left: (_) @a2 right: (identifier) @b2)
+                (binary_expression (identifier) @a3 (_) @b3)
+                (binary_expression left: (identifier) @a4 right: (_) @b4)
+            ",
+            results_by_substring: &[
+                ("left: (identifier) @a1", false),
+                ("right: (_) @b1", true),
+                ("left: (_) @a2", false),
+                ("right: (identifier) @b2", false),
+                ("(identifier) @a3", false),
+                ("(_) @b3", false),
+                ("left: (identifier) @a4", false),
+                ("right: (_) @b4", true),
+            ],
+            rooted: "RRRR",
+        },
+        Row {
+            description: "named and anonymous children",
+            language: get_language("javascript"),
+            pattern: r#"
+                (binary_expression left: (_) @a1 "+" right: (_) @b1)
+                (binary_expression left: (_) @a2 (_) @c2 right: (_) @b2)
+                (binary_expression left: (_) @a3 "+" right: (_) @b3)
+            "#,
+            results_by_substring: &[
+                ("left: (_) @a1", false),
+                ("\"+\" right: (_) @b1", false),
+                ("right: (_) @b1", true),
+                ("left: (_) @a2", false),
+                ("(_) @c2", false),
+                ("right: (_) @b2", false),
+                ("left: (_) @a3", false),
+                ("\"+\" right: (_) @b3", false),
+                ("right: (_) @b3", true),
+            ],
+            rooted: "RRR",
+        },
+        Row {
+            description: "alternatives and optional children",
+            language: get_language("javascript"),
+            pattern: r#"
+                (object "{" @o1 [(pair) (shorthand_property_identifier)] @a1 "}" @c1)
+                (object "{" @o2 [(pair) (shorthand_property_identifier)]? @a2 "}" @c2)
+                (object "{" @o3 [(pair) (shorthand_property_identifier)] @a3 "}" @c3)
+                (object "{" @o4 (pair)? @a4 "}" @c4)
+            "#,
+            results_by_substring: &[
+                ("\"{\" @o1", false),
+                ("[(pair) (shorthand_property_identifier)] @a1", false),
+                ("\"}\" @c1", true),
+                ("\"{\" @o2", true),
+                ("[(pair) (shorthand_property_identifier)]? @a2", false),
+                ("\"}\" @c2", true),
+                ("\"{\" @o3", false),
+                ("[(pair) (shorthand_property_identifier)] @a3", false),
+                ("\"}\" @c3", true),
+                ("\"{\" @o4", true),
+                ("(pair)? @a4", false),
+                ("\"}\" @c4", true),
+            ],
+            rooted: "RRRR",
+        },
+        Row {
+            description: "the same shape under alternative parents",
+            language: get_language("javascript"),
+            pattern: r"
+                [
+                    (array (number) @a1 (number) @b1)
+                    (array (string) @a2 (string) @b2)
+                    (array (number) @a3 (number) @b3)
+                ]
+                (array (number) @a4 (number) @b4)
+            ",
+            results_by_substring: &[
+                ("(number) @a1", false),
+                ("(number) @b1", false),
+                ("(string) @a2", false),
+                ("(string) @b2", false),
+                ("(number) @a3", false),
+                ("(number) @b3", false),
+                ("(number) @a4", false),
+                ("(number) @b4", false),
+            ],
+            rooted: "RR",
+        },
+        Row {
+            description: "a pair with a key and a value, twice",
+            language: get_language("javascript"),
+            pattern: r"
+                (pair key: (property_identifier) @a1 value: (_) @b1)
+                (pair key: (property_identifier) @a2 value: (_) @b2)
+            ",
+            results_by_substring: &[
+                ("key: (property_identifier) @a1", false),
+                ("value: (_) @b1", true),
+                ("key: (property_identifier) @a2", false),
+                ("value: (_) @b2", true),
+            ],
+            rooted: "RR",
+        },
+        Row {
+            description: "deeply nested patterns of the same shape",
+            language: get_language("json"),
+            pattern: r"
+                (document (object (pair value: (object (pair value: (object (pair key: (_) @a1)))))))
+                (document (object (pair value: (object (pair value: (object (pair key: (_) @a2)))))))
+                (document (object (pair value: (object (pair value: (array (number) @a3))))))
+            ",
+            results_by_substring: &[
+                (
+                    "(object (pair value: (object (pair value: (object (pair key: (_) @a1",
+                    false,
+                ),
+                (
+                    "value: (object (pair value: (object (pair key: (_) @a1",
+                    false,
+                ),
+                ("value: (object (pair key: (_) @a1", false),
+                ("key: (_) @a1", true),
+                (
+                    "(object (pair value: (object (pair value: (object (pair key: (_) @a2",
+                    false,
+                ),
+                (
+                    "value: (object (pair value: (object (pair key: (_) @a2",
+                    false,
+                ),
+                ("value: (object (pair key: (_) @a2", false),
+                ("key: (_) @a2", true),
+                ("value: (object (pair value: (array (number) @a3", false),
+                ("value: (array (number) @a3", false),
+                ("(number) @a3", false),
+            ],
+            rooted: "RRR",
+        },
+        Row {
+            description: "sibling sequences that are not rooted",
+            language: get_language("javascript"),
+            pattern: r"
+                ((comment) @c1 . (function_declaration) @f1)
+                ((comment) @c2 . (function_declaration) @f2)
+                (program (comment) @c3 . (function_declaration) @f3)
+            ",
+            results_by_substring: &[
+                ("(comment) @c1", false),
+                ("(function_declaration) @f1", false),
+                ("(comment) @c2", false),
+                ("(function_declaration) @f2", false),
+                ("(comment) @c3", false),
+                ("(function_declaration) @f3", false),
+            ],
+            rooted: "rrR",
+        },
+        Row {
+            description: "quantifiers",
+            language: get_language("javascript"),
+            pattern: r#"
+                (object "{" (pair)+ @a1 "}" @c1)
+                (object "{" (pair)* @a2 "}" @c2)
+                (object "{" (pair)? @a3 "}" @c3)
+                (object "{" (pair) @a4 "}" @c4)
+                (object "{" (pair)+ @a5 "}" @c5)
+            "#,
+            results_by_substring: &[
+                ("\"{\" (pair)+ @a1", false),
+                ("(pair)+ @a1", false),
+                ("\"}\" @c1", true),
+                ("\"{\" (pair)* @a2", true),
+                ("(pair)* @a2", false),
+                ("\"}\" @c2", true),
+                ("\"{\" (pair)? @a3", true),
+                ("(pair)? @a3", false),
+                ("\"}\" @c3", true),
+                ("\"{\" (pair) @a4", false),
+                ("(pair) @a4", false),
+                ("\"}\" @c4", true),
+                ("\"{\" (pair)+ @a5", false),
+                ("(pair)+ @a5", false),
+                ("\"}\" @c5", true),
+            ],
+            rooted: "RRRRR",
+        },
+        Row {
+            description: "named and anonymous wildcards",
+            language: get_language("javascript"),
+            pattern: r"
+                (array _ @a1 _ @b1)
+                (array (_) @a2 (_) @b2)
+                (array _ @a3 _ @b3)
+                (array (_) @a4 (_) @b4)
+            ",
+            results_by_substring: &[
+                ("_ @a1", true),
+                ("_ @b1", true),
+                ("(_) @a2", false),
+                ("(_) @b2", false),
+                ("_ @a3", true),
+                ("_ @b3", true),
+                ("(_) @a4", false),
+                ("(_) @b4", false),
+            ],
+            rooted: "RRRR",
+        },
+        Row {
+            description: "alternatives and optional children between tokens",
+            language: get_language("javascript"),
+            pattern: r#"
+                (array "[" @o1 [(number) (string)] @a1 "]" @c1)
+                (array "[" @o2 [(number) (string)]? @a2 "]" @c2)
+                (array "[" @o3 [(number) (string)] @a3 "]" @c3)
+                (array "[" @o4 (number)? @a4 (string)? @b4 "]" @c4)
+                (array "[" @o5 (number) @a5 (string)? @b5 "]" @c5)
+                (array "[" @o6 [(number) (string)]? @a6 "]" @c6)
+            "#,
+            results_by_substring: &[
+                ("\"[\" @o1", false),
+                ("[(number) (string)] @a1", false),
+                ("\"]\" @c1", true),
+                ("\"[\" @o2", true),
+                ("[(number) (string)]? @a2", false),
+                ("\"]\" @c2", true),
+                ("\"[\" @o3", false),
+                ("[(number) (string)] @a3", false),
+                ("\"]\" @c3", true),
+                ("\"[\" @o4", true),
+                ("(number)? @a4", false),
+                ("(string)? @b4", false),
+                ("\"]\" @c4", true),
+                ("\"[\" @o5", false),
+                ("(number) @a5", false),
+                ("(string)? @b5", false),
+                ("\"]\" @c5", true),
+                ("\"[\" @o6", true),
+                ("[(number) (string)]? @a6", false),
+                ("\"]\" @c6", true),
+            ],
+            rooted: "RRRRRR",
+        },
+    ];
+
+    allocations::record(|| {
+        for row in rows {
+            if let Some(filter) = EXAMPLE_FILTER.as_ref()
+                && !row.description.contains(filter.as_str())
+            {
+                continue;
+            }
+            let query = Query::new(&row.language, row.pattern).unwrap();
+            let mut mismatches = Vec::new();
+            for (substring, is_guaranteed) in row.results_by_substring {
+                let offset = row.pattern.find(substring).unwrap();
+                if query.is_pattern_guaranteed_at_step(offset) != *is_guaranteed {
+                    mismatches.push((*substring, !is_guaranteed));
+                }
+            }
+            assert!(
+                mismatches.is_empty(),
+                "Description: {}, steps whose result is not the expected one, with their result: {:?}",
+                row.description,
+                mismatches,
+            );
+            let rooted = (0..query.pattern_count())
+                .map(|index| {
+                    if query.is_pattern_rooted(index) {
+                        'R'
+                    } else {
+                        'r'
+                    }
+                })
+                .collect::<String>();
+            assert_eq!(rooted, row.rooted, "Description: {}", row.description);
+        }
+    });
+}
+
+#[test]
+fn test_query_analysis_errors_after_patterns_of_the_same_shape() {
+    struct Row {
+        description: &'static str,
+        language: Language,
+        pattern: &'static str,
+        // The step that can never match, which is where the error is reported.
+        error_at: &'static str,
+    }
+
+    let rows = [
+        Row {
+            description: "a child that is not a field of the parent",
+            language: get_language("javascript"),
+            pattern: r"
+                (binary_expression left: (identifier) right: (_))
+                (binary_expression left: (identifier) right: (_))
+                (binary_expression left: (identifier) (property_identifier))
+            ",
+            error_at: "(property_identifier)",
+        },
+        Row {
+            description: "a child that the parent cannot have",
+            language: get_language("javascript"),
+            pattern: r"
+                (array (number) (string) (identifier))
+                (array (number) (string) (identifier))
+                (array (number) (statement_block))
+            ",
+            error_at: "(statement_block)",
+        },
+        Row {
+            description: "a field that the child cannot have",
+            language: get_language("javascript"),
+            pattern: r"
+                (if_statement condition: (parenthesized_expression) consequence: (statement_block))
+                (if_statement condition: (parenthesized_expression) consequence: (statement_block))
+                (if_statement consequence: (parenthesized_expression))
+            ",
+            error_at: "consequence: (parenthesized_expression))",
+        },
+        Row {
+            description: "a nested child that the grandparent cannot have",
+            language: get_language("javascript"),
+            pattern: r"
+                (call_expression function: (identifier) arguments: (arguments (string)))
+                (call_expression function: (identifier) arguments: (arguments (string)))
+                (call_expression function: (identifier) arguments: (arguments (statement_block)))
+            ",
+            error_at: "(statement_block)",
+        },
+        Row {
+            description: "a field with a child of the wrong type",
+            language: get_language("python"),
+            pattern: r"
+                (function_definition name: (identifier) body: (block))
+                (function_definition name: (identifier) body: (block))
+                (function_definition name: (identifier) body: (identifier))
+            ",
+            error_at: "body: (identifier)",
+        },
+        Row {
+            description: "swapped child types in the last of three nested patterns",
+            language: get_language("json"),
+            pattern: r"
+                (document (object (pair key: (string) value: (number))))
+                (document (object (pair key: (string) value: (number))))
+                (document (object (pair key: (number) value: (string))))
+            ",
+            error_at: "key: (number)",
+        },
+    ];
+
+    allocations::record(|| {
+        for row in rows {
+            if let Some(filter) = EXAMPLE_FILTER.as_ref()
+                && !row.description.contains(filter.as_str())
+            {
+                continue;
+            }
+            let error = Query::new(&row.language, row.pattern).unwrap_err();
+            assert_eq!(
+                (error.kind, error.offset),
+                (
+                    QueryErrorKind::Structure,
+                    row.pattern.find(row.error_at).unwrap()
+                ),
+                "Description: {}",
+                row.description
+            );
+        }
+    });
+}
+
+const MUTATIONS_PER_SEED: usize = 60;
+
+/// The spans of the node types, which follow an opening parenthesis, and of the
+/// field names, which precede a colon, in a query. The flag is true for node
+/// types.
+fn node_type_and_field_spans(source: &str) -> Vec<(usize, usize, bool)> {
+    let bytes = source.as_bytes();
+    let is_identifier_byte =
+        |byte: u8| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_';
+    let mut spans = Vec::new();
+    let mut start = 0;
+    while start < bytes.len() {
+        if !is_identifier_byte(bytes[start]) || bytes[start].is_ascii_digit() {
+            start += 1;
+            continue;
+        }
+        let mut end = start;
+        while end < bytes.len() && is_identifier_byte(bytes[end]) {
+            end += 1;
+        }
+        if start > 0 && bytes[start - 1] == b'(' {
+            spans.push((start, end, true));
+        } else if bytes.get(end) == Some(&b':') {
+            spans.push((start, end, false));
+        }
+        start = end;
+    }
+    spans
+}
+
+/// Swap a few of the node types and field names of a query for others, which
+/// mostly produces queries that can never match.
+fn mutate_query(
+    source: &str,
+    node_types: &[&str],
+    field_names: &[&str],
+    random: &mut impl FnMut(usize) -> usize,
+) -> String {
+    let spans = node_type_and_field_spans(source);
+    let mut edits = (0..=random(2))
+        .map(|_| spans[random(spans.len())])
+        .collect::<Vec<_>>();
+    edits.sort_unstable();
+    edits.dedup();
+    let mut mutated = source.to_string();
+    for (start, end, is_node_type) in edits.into_iter().rev() {
+        let replacement = if is_node_type {
+            node_types[random(node_types.len())]
+        } else {
+            field_names[random(field_names.len())]
+        };
+        mutated.replace_range(start..end, replacement);
+    }
+    mutated
+}
+
+#[test]
+fn test_query_analysis_of_mutated_queries() {
+    struct Row {
+        language_name: &'static str,
+        seeds: &'static [&'static str],
+        // The number of mutated queries that are accepted and rejected, and a
+        // hash of the analysis of all of them.
+        expected: (usize, usize, u64),
+    }
+
+    let rows = [
+        Row {
+            language_name: "javascript",
+            seeds: &[
+                r"[
+                    (function_declaration name: (identifier) @n parameters: (formal_parameters (identifier)? @a) body: (statement_block))
+                    (generator_function_declaration name: (identifier) @n body: (statement_block))
+                ]",
+                r#"(if_statement
+                    condition: (parenthesized_expression (binary_expression left: (_) @l operator: ["==" "!="] right: (_) @r))
+                    consequence: (statement_block (expression_statement (call_expression function: (identifier) @f)))
+                    alternative: (else_clause (if_statement))?)"#,
+                r"(variable_declaration (variable_declarator name: [(identifier) (object_pattern) (array_pattern)] @n value: [(arrow_function) (function_expression) (class)] @v))",
+                r"(class_declaration name: (identifier) @n (class_heritage (identifier) @h) body: (class_body (method_definition name: (property_identifier) @m parameters: (formal_parameters) body: (statement_block)) @method))",
+                r"(for_statement initializer: (lexical_declaration (variable_declarator name: (identifier))) condition: (_) increment: (update_expression) body: (statement_block))",
+                r"(object (pair key: (property_identifier) @k value: (object (pair key: (property_identifier) value: (object (pair key: (_) value: (_)))))))",
+                r"(try_statement body: (statement_block) handler: (catch_clause parameter: (identifier) body: (statement_block)) finalizer: (finally_clause (statement_block)))",
+                r"[(array (number) (number) (number)) (array (string) (string) (string)) (array (identifier) (identifier) (identifier))]",
+                r"(ternary_expression condition: (binary_expression left: (_) right: (_)) consequence: (call_expression) alternative: (member_expression))
+                  (ternary_expression condition: (binary_expression left: (_) right: (_)) consequence: (call_expression) alternative: (member_expression))",
+            ],
+            expected: (85, 455, 0x05cf_499c_7e5e_4e93),
+        },
+        Row {
+            language_name: "python",
+            seeds: &[
+                r"(function_definition name: (identifier) @n parameters: (parameters (identifier)? @p) body: (block (expression_statement (string) @doc)))",
+                r"(class_definition name: (identifier) superclasses: (argument_list (identifier)) body: (block (function_definition name: (identifier))))",
+                r"(if_statement condition: (comparison_operator (identifier) (integer)) consequence: (block (return_statement (identifier))) alternative: [(elif_clause (comparison_operator)) (else_clause (block))])",
+                r"(call function: [(identifier) (attribute object: (identifier) attribute: (identifier))] @f arguments: (argument_list (keyword_argument name: (identifier) value: (_))))",
+                r"(for_statement left: (identifier) right: (call function: (identifier) arguments: (argument_list)) body: (block))",
+                r"(try_statement body: (block) (except_clause (identifier)? (block)) (finally_clause (block)))",
+            ],
+            expected: (40, 320, 0xc27a_e708_2066_63b8),
+        },
+        Row {
+            language_name: "rust",
+            seeds: &[
+                r"(function_item name: (identifier) parameters: (parameters (parameter pattern: (identifier) type: (type_identifier))) body: (block (let_declaration pattern: (identifier) value: (call_expression))))",
+                r"(impl_item trait: (type_identifier) type: (type_identifier) body: (declaration_list (function_item name: (identifier))))",
+                r"(match_expression value: (identifier) body: (match_block (match_arm pattern: (match_pattern (identifier)) value: (_))))",
+                r"[
+                    (struct_item name: (type_identifier) body: (field_declaration_list (field_declaration name: (field_identifier) type: (_))))
+                    (enum_item name: (type_identifier) body: (enum_variant_list (enum_variant name: (identifier))))
+                ]",
+                r"(call_expression function: (scoped_identifier path: (identifier) name: (identifier)) arguments: (arguments (reference_expression) (_)))",
+            ],
+            expected: (27, 273, 0x7a9f_56d7_93dc_4ade),
+        },
+        Row {
+            language_name: "json",
+            seeds: &[
+                r"(document (object (pair key: (string (string_content)) value: [(object (pair)) (array (number) (number)) (string) (number) (true) (false) (null)])))",
+            ],
+            expected: (22, 38, 0xaf98_16ef_8d6f_3e67),
+        },
+    ];
+
+    allocations::record(|| {
+        let mut mismatches = Vec::new();
+        for row in rows {
+            let language = get_language(row.language_name);
+            for seed in row.seeds {
+                Query::new(&language, seed).unwrap();
+            }
+            // Swap the node types and fields of the seeds for each other, which
+            // makes valid queries more likely than swapping them for any of
+            // the language's.
+            let (mut node_types, mut field_names) = (vec!["_"], Vec::new());
+            for seed in row.seeds {
+                for (start, end, is_node_type) in node_type_and_field_spans(seed) {
+                    let name = &seed[start..end];
+                    let names = if is_node_type {
+                        &mut node_types
+                    } else {
+                        &mut field_names
+                    };
+                    if !names.contains(&name) {
+                        names.push(name);
+                    }
+                }
+            }
+
+            // A fixed linear congruential generator, so that the mutated queries
+            // are the same on every run and with every version of `rand`.
+            let mut state = 0x853c_49e6_748f_ea9b_u64;
+            let mut random = |bound: usize| {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                ((state >> 33) as usize) % bound
+            };
+
+            let (mut accepted, mut rejected) = (0, 0);
+            let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+            for seed in row.seeds {
+                for index in 0..MUTATIONS_PER_SEED {
+                    let source = if index == 0 {
+                        (*seed).to_string()
+                    } else {
+                        mutate_query(seed, &node_types, &field_names, &mut random)
+                    };
+                    let outcome = query_analysis_outcome(&language, &source);
+                    if outcome.contains(" error at ") {
+                        rejected += 1;
+                    } else {
+                        accepted += 1;
+                    }
+                    for byte in source.bytes().chain(outcome.bytes()) {
+                        hash = (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3);
+                    }
+                }
+            }
+            if (accepted, rejected, hash) != row.expected {
+                mismatches.push((row.language_name, (accepted, rejected, hash)));
+            }
+        }
+        assert!(
+            mismatches.is_empty(),
+            "Languages whose queries were analyzed differently, with their results: {mismatches:?}"
+        );
+    });
+}

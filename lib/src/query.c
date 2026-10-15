@@ -292,6 +292,10 @@ typedef struct {
   uint32_t slot_count;
   uint32_t used;
   AnalysisTransitionArray transitions;
+  // For each subgraph, the set of parse states that occur in its nodes, built
+  // on first use, so that most successors can be rejected without a search.
+  uint8_t **subgraph_states;
+  uint32_t subgraph_count;
 } AnalysisTransitionCache;
 
 /*
@@ -1258,6 +1262,10 @@ static inline QueryAnalysis query_analysis__new(void) {
 static inline void query_analysis__delete(QueryAnalysis *self) {
   ts_free(self->transition_cache.slots);
   array_delete(&self->transition_cache.transitions);
+  for (uint32_t i = 0; i < self->transition_cache.subgraph_count; i++) {
+    ts_free(self->transition_cache.subgraph_states[i]);
+  }
+  ts_free(self->transition_cache.subgraph_states);
   analysis_state_set__delete(&self->states);
   analysis_state_set__delete(&self->next_states);
   analysis_state_set__delete(&self->deeper_states);
@@ -1371,16 +1379,13 @@ static inline void ts_query__pattern_map_insert(
 // hypothetical node for the given parent symbol, and append them to `out`.
 static void ts_query__compute_transitions(
   const TSQuery *self,
-  const AnalysisSubgraphArray *subgraphs,
-  TSSymbol parent_symbol,
+  const AnalysisSubgraph *subgraph,
+  const uint8_t *subgraph_states,
   TSStateId parse_state,
   unsigned child_index,
   AnalysisTransitionArray *out
 ) {
-  unsigned subgraph_index, exists;
-  array_search_sorted_by(subgraphs, .symbol, parent_symbol, &subgraph_index, &exists);
-  if (!exists) return;
-  const AnalysisSubgraph *subgraph = array_get(subgraphs, subgraph_index);
+  unsigned exists;
 
   // Follow every possible path in the parse table, but only visit states that
   // are part of the subgraph for the current symbol.
@@ -1408,6 +1413,11 @@ static void ts_query__compute_transitions(
     } else {
       continue;
     }
+
+    if (
+      successor.state >= self->language->state_count ||
+      !(subgraph_states[successor.state >> 3] & (1u << (successor.state & 7)))
+    ) continue;
 
     unsigned node_index;
     array_search_sorted_with(
@@ -1489,7 +1499,26 @@ static const AnalysisTransition *ts_query__get_transitions(
   }
 
   uint32_t offset = cache->transitions.size;
-  ts_query__compute_transitions(self, subgraphs, parent_symbol, parse_state, child_index, &cache->transitions);
+  unsigned subgraph_index, exists;
+  array_search_sorted_by(subgraphs, .symbol, parent_symbol, &subgraph_index, &exists);
+  if (exists) {
+    if (!cache->subgraph_states) {
+      cache->subgraph_count = subgraphs->size;
+      cache->subgraph_states = ts_calloc(subgraphs->size, sizeof(uint8_t *));
+    }
+    const AnalysisSubgraph *subgraph = array_get(subgraphs, subgraph_index);
+    if (!cache->subgraph_states[subgraph_index]) {
+      uint8_t *states = ts_calloc(((size_t)self->language->state_count + 7) / 8 + 1, 1);
+      for (uint32_t i = 0; i < subgraph->nodes.size; i++) {
+        TSStateId node_state = array_get(&subgraph->nodes, i)->state;
+        states[node_state >> 3] |= 1u << (node_state & 7);
+      }
+      cache->subgraph_states[subgraph_index] = states;
+    }
+    ts_query__compute_transitions(
+      self, subgraph, cache->subgraph_states[subgraph_index], parse_state, child_index, &cache->transitions
+    );
+  }
   cache->slots[h] = (AnalysisTransitionSlot) {
     .key = key,
     .offset = offset,

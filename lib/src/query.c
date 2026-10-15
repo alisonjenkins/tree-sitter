@@ -2090,8 +2090,18 @@ static bool ts_query__analyze_patterns(TSQuery *self, unsigned *error_offset) {
   //      with information about the node that would be created.
   //   3) A list of predecessor states for each state.
   StatePredecessorMap predecessor_map = state_predecessor_map_new(self->language);
+
+  // Index the subgraphs by symbol, because every reduce action and every goto
+  // in the parse table looks up the subgraph of its symbol. Entries are one
+  // more than the subgraph's index; zero means that the symbol has none.
+  uint32_t subgraph_index_size = self->language->symbol_count + self->language->alias_count + 1;
+  uint16_t *subgraph_index_by_symbol = ts_calloc(subgraph_index_size, sizeof(uint16_t));
+  for (unsigned i = 0; i < subgraphs.size; i++) {
+    TSSymbol subgraph_symbol = array_get(&subgraphs, i)->symbol;
+    if (subgraph_symbol < subgraph_index_size) subgraph_index_by_symbol[subgraph_symbol] = i + 1;
+  }
+
   for (TSStateId state = 1; state < (uint16_t)self->language->state_count; state++) {
-    unsigned subgraph_index, exists;
     LookaheadIterator lookahead_iterator = ts_language_lookaheads(self->language, state);
     while (ts_lookahead_iterator__next(&lookahead_iterator)) {
       if (lookahead_iterator.action_count) {
@@ -2106,15 +2116,9 @@ static bool ts_query__analyze_patterns(TSQuery *self, unsigned *error_offset) {
               &aliases_end
             );
             for (const TSSymbol *symbol = aliases; symbol < aliases_end; symbol++) {
-              array_search_sorted_by(
-                &subgraphs,
-                .symbol,
-                *symbol,
-                &subgraph_index,
-                &exists
-              );
-              if (exists) {
-                AnalysisSubgraph *subgraph = array_get(&subgraphs, subgraph_index);
+              unsigned subgraph_slot = *symbol < subgraph_index_size ? subgraph_index_by_symbol[*symbol] : 0;
+              if (subgraph_slot) {
+                AnalysisSubgraph *subgraph = array_get(&subgraphs, subgraph_slot - 1);
                 if (subgraph->nodes.size == 0 || array_back(&subgraph->nodes)->state != state) {
                   array_push(&subgraph->nodes, ((AnalysisSubgraphNode) {
                     .state = state,
@@ -2143,15 +2147,9 @@ static bool ts_query__analyze_patterns(TSQuery *self, unsigned *error_offset) {
             &aliases_end
           );
           for (const TSSymbol *symbol = aliases; symbol < aliases_end; symbol++) {
-            array_search_sorted_by(
-              &subgraphs,
-              .symbol,
-              *symbol,
-              &subgraph_index,
-              &exists
-            );
-            if (exists) {
-              AnalysisSubgraph *subgraph = array_get(&subgraphs, subgraph_index);
+            unsigned subgraph_slot = *symbol < subgraph_index_size ? subgraph_index_by_symbol[*symbol] : 0;
+            if (subgraph_slot) {
+              AnalysisSubgraph *subgraph = array_get(&subgraphs, subgraph_slot - 1);
               if (
                 subgraph->start_states.size == 0 ||
                 *array_back(&subgraph->start_states) != state
@@ -2163,6 +2161,8 @@ static bool ts_query__analyze_patterns(TSQuery *self, unsigned *error_offset) {
       }
     }
   }
+
+  ts_free(subgraph_index_by_symbol);
 
   // For each subgraph, compute the preceding states by walking backward
   // from the end states using the predecessor map.

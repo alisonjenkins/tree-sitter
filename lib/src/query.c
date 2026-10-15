@@ -294,6 +294,32 @@ typedef struct {
   AnalysisTransitionArray transitions;
 } AnalysisTransitionCache;
 
+/*
+ * AnalysisMemo - The outcome of analyzing a parent step depends only on the
+ * parent symbol and on the steps that analysis can read below it, so parent
+ * steps that have the same shape share one analysis. Steps are described
+ * relative to the parent step, because their absolute indices differ.
+ */
+typedef Array(uint32_t) AnalysisMemoKey;
+
+typedef struct {
+  uint32_t hash;
+  uint32_t key_offset;
+  uint32_t key_length;
+  uint32_t final_offset;
+  uint32_t final_count;
+  uint32_t finished_offset;
+  uint32_t finished_count;
+  bool did_abort;
+} AnalysisMemoEntry;
+
+typedef struct {
+  Array(AnalysisMemoEntry) entries;
+  AnalysisMemoKey keys;
+  Array(uint16_t) final_offsets;
+  Array(TSSymbol) finished_symbols;
+} AnalysisMemo;
+
 typedef struct {
   AnalysisStateSet states;
   AnalysisStateSet next_states;
@@ -1778,6 +1804,148 @@ static void ts_query__dump_steps(const TSQuery *self, const char *label) {
 }
 #endif
 
+// The most steps whose properties are written into a memo key. Larger
+// patterns are analyzed without memoization.
+#define MAX_ANALYSIS_MEMO_STEPS 64
+
+static bool ts_query__analysis_memo_key(
+  const TSQuery *self,
+  uint32_t parent_step_index,
+  AnalysisMemoKey *key
+) {
+  const QueryStep *parent = array_get(&self->steps, parent_step_index);
+  uint16_t parent_depth = parent->depth;
+
+  // Collect every step that analysis of this parent can read: the steps of the
+  // parent's subtree, the step that ends it, and the steps that the end can
+  // lead to through pass-through and alternative links.
+  uint32_t visited[MAX_ANALYSIS_MEMO_STEPS];
+  uint32_t visited_count = 0;
+  uint32_t end_index = parent_step_index + 1;
+  while (end_index < self->steps.size) {
+    const QueryStep *step = array_get(&self->steps, end_index);
+    if (step->depth == PATTERN_DONE_MARKER || step->depth <= parent_depth) break;
+    end_index++;
+  }
+  if (end_index >= self->steps.size) return false;
+  if (end_index + 1 - (parent_step_index + 1) > MAX_ANALYSIS_MEMO_STEPS) return false;
+  for (uint32_t i = parent_step_index + 1; i <= end_index; i++) visited[visited_count++] = i;
+
+  for (uint32_t i = 0; i < visited_count; i++) {
+    uint32_t index = visited[i];
+    const QueryStep *step = array_get(&self->steps, index);
+    uint32_t next[2];
+    unsigned next_count = 0;
+    if (index >= end_index) {
+      if (step->is_pass_through) next[next_count++] = index + 1;
+    }
+    if (step->alternative_index != NONE && step->alternative_index > index) {
+      next[next_count++] = step->alternative_index;
+    }
+    for (unsigned n = 0; n < next_count; n++) {
+      if (next[n] >= self->steps.size) return false;
+      bool seen = false;
+      for (uint32_t j = 0; j < visited_count; j++) {
+        if (visited[j] == next[n]) { seen = true; break; }
+      }
+      if (seen) continue;
+      if (visited_count == MAX_ANALYSIS_MEMO_STEPS) return false;
+      visited[visited_count++] = next[n];
+    }
+  }
+
+  // Order the steps so that equal shapes serialize identically.
+  for (uint32_t i = 1; i < visited_count; i++) {
+    uint32_t value = visited[i];
+    uint32_t j = i;
+    while (j > 0 && visited[j - 1] > value) { visited[j] = visited[j - 1]; j--; }
+    visited[j] = value;
+  }
+
+  array_clear(key);
+  array_push(key, parent->symbol);
+  array_push(key, visited_count);
+  for (uint32_t i = 0; i < visited_count; i++) {
+    uint32_t index = visited[i];
+    const QueryStep *step = array_get(&self->steps, index);
+    array_push(key, index - parent_step_index);
+    array_push(key, step->depth == PATTERN_DONE_MARKER ? UINT32_MAX : (uint32_t)((int32_t)step->depth - (int32_t)parent_depth));
+    array_push(key, step->symbol | ((uint32_t)step->supertype_symbol << 16));
+    array_push(key,
+      step->field |
+      ((uint32_t)step->is_named << 16) |
+      ((uint32_t)step->is_pass_through << 17) |
+      ((uint32_t)step->is_dead_end << 18)
+    );
+    array_push(key, step->alternative_index == NONE ? UINT32_MAX : step->alternative_index - parent_step_index);
+  }
+  return true;
+}
+
+static uint32_t ts_query__analysis_memo_hash(const uint32_t *key, uint32_t length) {
+  uint32_t hash = 2166136261u;
+  for (uint32_t i = 0; i < length; i++) {
+    hash = (hash ^ key[i]) * 16777619u;
+  }
+  return hash;
+}
+
+// Restore the outcome of an earlier analysis of a parent step with the same
+// shape. Returns false if there is none.
+static bool ts_query__analysis_memo_lookup(
+  const AnalysisMemo *memo,
+  const AnalysisMemoKey *key,
+  uint32_t hash,
+  uint32_t parent_step_index,
+  QueryAnalysis *analysis
+) {
+  for (uint32_t i = 0; i < memo->entries.size; i++) {
+    const AnalysisMemoEntry *entry = array_get(&memo->entries, i);
+    if (entry->hash != hash || entry->key_length != key->size) continue;
+    if (memcmp(memo->keys.contents + entry->key_offset, key->contents, key->size * sizeof(uint32_t)) != 0) continue;
+
+    array_clear(&analysis->final_step_indices);
+    array_clear(&analysis->finished_parent_symbols);
+    for (uint32_t j = 0; j < entry->final_count; j++) {
+      array_push(
+        &analysis->final_step_indices,
+        (uint16_t)(parent_step_index + *array_get(&memo->final_offsets, entry->final_offset + j))
+      );
+    }
+    for (uint32_t j = 0; j < entry->finished_count; j++) {
+      array_push(&analysis->finished_parent_symbols, *array_get(&memo->finished_symbols, entry->finished_offset + j));
+    }
+    analysis->did_abort = entry->did_abort;
+    return true;
+  }
+  return false;
+}
+
+static void ts_query__analysis_memo_store(
+  AnalysisMemo *memo,
+  const AnalysisMemoKey *key,
+  uint32_t hash,
+  uint32_t parent_step_index,
+  const QueryAnalysis *analysis
+) {
+  AnalysisMemoEntry entry = {
+    .hash = hash,
+    .key_offset = memo->keys.size,
+    .key_length = key->size,
+    .final_offset = memo->final_offsets.size,
+    .final_count = analysis->final_step_indices.size,
+    .finished_offset = memo->finished_symbols.size,
+    .finished_count = analysis->finished_parent_symbols.size,
+    .did_abort = analysis->did_abort,
+  };
+  array_extend(&memo->keys, key->size, key->contents);
+  for (uint32_t j = 0; j < analysis->final_step_indices.size; j++) {
+    array_push(&memo->final_offsets, (uint16_t)(*array_get(&analysis->final_step_indices, j) - parent_step_index));
+  }
+  array_extend(&memo->finished_symbols, analysis->finished_parent_symbols.size, analysis->finished_parent_symbols.contents);
+  array_push(&memo->entries, entry);
+}
+
 static bool ts_query__analyze_patterns(TSQuery *self, unsigned *error_offset) {
   Array(uint16_t) non_rooted_pattern_start_steps = array_new();
   for (unsigned i = 0; i < self->pattern_map.size; i++) {
@@ -2034,6 +2202,13 @@ static bool ts_query__analyze_patterns(TSQuery *self, unsigned *error_offset) {
   // For each non-terminal pattern, determine if the pattern can successfully match,
   // and identify all of the possible children within the pattern where matching could fail.
   QueryAnalysis analysis = query_analysis__new();
+  AnalysisMemo memo = {
+    .entries = array_new(),
+    .keys = array_new(),
+    .final_offsets = array_new(),
+    .finished_symbols = array_new(),
+  };
+  AnalysisMemoKey memo_key = array_new();
   for (unsigned i = 0; i < parent_step_indices.size; i++) {
     uint16_t parent_step_index = *array_get(&parent_step_indices, i);
     uint16_t parent_depth = array_get(&self->steps, parent_step_index)->depth;
@@ -2054,38 +2229,48 @@ static bool ts_query__analyze_patterns(TSQuery *self, unsigned *error_offset) {
       break;
     }
 
-    // Initialize an analysis state at every parse state in the table where
-    // this parent symbol can occur.
-    AnalysisSubgraph *subgraph = array_get(&subgraphs, subgraph_index);
-    analysis_state_set__clear(&analysis.states, &analysis.state_pool);
-    analysis_state_set__clear(&analysis.deeper_states, &analysis.state_pool);
-    for (unsigned j = 0; j < subgraph->start_states.size; j++) {
-      TSStateId parse_state = *array_get(&subgraph->start_states, j);
-      analysis_state_set__push(&analysis.states, &analysis.state_pool, &((AnalysisState) {
-        .step_index = parent_step_index + 1,
-        .stack = {
-          [0] = {
-            .parse_state = parse_state,
-            .parent_symbol = parent_symbol,
-            .child_index = 0,
-            .field_id = 0,
-            .done = false,
+    // Reuse the outcome of an earlier parent step with the same shape.
+    bool can_memoize = ts_query__analysis_memo_key(self, parent_step_index, &memo_key);
+    uint32_t memo_hash = can_memoize ? ts_query__analysis_memo_hash(memo_key.contents, memo_key.size) : 0;
+    bool memo_hit = can_memoize && ts_query__analysis_memo_lookup(
+      &memo, &memo_key, memo_hash, parent_step_index, &analysis
+    );
+
+    if (!memo_hit) {
+      // Initialize an analysis state at every parse state in the table where
+      // this parent symbol can occur.
+      AnalysisSubgraph *subgraph = array_get(&subgraphs, subgraph_index);
+      analysis_state_set__clear(&analysis.states, &analysis.state_pool);
+      analysis_state_set__clear(&analysis.deeper_states, &analysis.state_pool);
+      for (unsigned j = 0; j < subgraph->start_states.size; j++) {
+        TSStateId parse_state = *array_get(&subgraph->start_states, j);
+        analysis_state_set__push(&analysis.states, &analysis.state_pool, &((AnalysisState) {
+          .step_index = parent_step_index + 1,
+          .stack = {
+            [0] = {
+              .parse_state = parse_state,
+              .parent_symbol = parent_symbol,
+              .child_index = 0,
+              .field_id = 0,
+              .done = false,
+            },
           },
-        },
-        .depth = 1,
-        .root_symbol = parent_symbol,
-      }));
+          .depth = 1,
+          .root_symbol = parent_symbol,
+        }));
+      }
+
+      #ifdef DEBUG_ANALYZE_QUERY
+        printf(
+          "\nWalk states for %s:\n",
+          ts_language_symbol_name(self->language, (*array_get(&analysis.states, 0))->stack[0].parent_symbol)
+        );
+      #endif
+
+      analysis.did_abort = false;
+      ts_query__perform_analysis(self, &subgraphs, &analysis);
+      if (can_memoize) ts_query__analysis_memo_store(&memo, &memo_key, memo_hash, parent_step_index, &analysis);
     }
-
-    #ifdef DEBUG_ANALYZE_QUERY
-      printf(
-        "\nWalk states for %s:\n",
-        ts_language_symbol_name(self->language, (*array_get(&analysis.states, 0))->stack[0].parent_symbol)
-      );
-    #endif
-
-    analysis.did_abort = false;
-    ts_query__perform_analysis(self, &subgraphs, &analysis);
 
     // If this pattern could not be fully analyzed, then every step should
     // be considered fallible.
@@ -2291,6 +2476,11 @@ static bool ts_query__analyze_patterns(TSQuery *self, unsigned *error_offset) {
   }
   array_delete(&subgraphs);
   query_analysis__delete(&analysis);
+  array_delete(&memo.entries);
+  array_delete(&memo.keys);
+  array_delete(&memo.final_offsets);
+  array_delete(&memo.finished_symbols);
+  array_delete(&memo_key);
   array_delete(&next_nodes);
   array_delete(&predicate_capture_ids);
   state_predecessor_map_delete(&predecessor_map);
